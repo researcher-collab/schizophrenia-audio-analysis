@@ -31,7 +31,7 @@ from sklearn.neural_network import MLPClassifier
 from sklearn.feature_selection import SelectKBest, f_classif, VarianceThreshold
 
 import joblib
-
+import shap
 
 # ==========================================================
 # Utility: class distribution
@@ -187,7 +187,7 @@ data = data.join(data['File'].apply(extract_metadata))
 data['ID'] = pd.to_numeric(data['ID'], errors='coerce').astype('Int64')
 
 # 3) Filter
-data = data[data['Role'] = 'patient']
+data = data[data['Role'] == 'patient']
 
 # 4) Keep only rows with fully labelled Group/Gender/Race/ID
 data = data[
@@ -251,6 +251,7 @@ print(f"\nDataset balanced to {min_class_size} samples per class.")
 print(data['Group'].value_counts())
 
 # Feature matrix and binary label vector
+data = data.reset_index(drop=True)                                 
 X = data[features_to_keep]
 y = data['Group'].map({'control': 0, 'schizophrenia': 1}).astype('int8')
 
@@ -265,13 +266,28 @@ X_scaled = scaler.fit_transform(X)
 # ==========================================================
 # Feature Selection (Univariate ANOVA F-test)
 # ==========================================================
-k_features = min(50, X_scaled.shape[1])  
+k_features = min(10, X_scaled.shape[1])  
 kbest_selector = SelectKBest(score_func=f_classif, k=k_features)
 X_selected = kbest_selector.fit_transform(X_scaled, y)
 selected_features = features_to_keep[kbest_selector.get_support(indices=True)]
 
 print(f"\nSelected top {k_features} features:")
 print(selected_features)
+all_idx = np.arange(len(X_selected))
+train_idx, test_idx = train_test_split(
+    all_idx,
+    test_size=0.2,
+    random_state=42,
+    stratify=y,
+)
+
+X_train = X_selected[train_idx]
+X_test  = X_selected[test_idx]
+y_train = y.iloc[train_idx].values
+y_test  = y.iloc[test_idx].values
+
+# Keep Gender/Race labels aligned to X_test rows for subgroup filtering
+meta_test = data[['Gender', 'Race']].iloc[test_idx].reset_index(drop=True)                    
 
 
 # ==========================================================
@@ -285,6 +301,7 @@ def evaluate_model(
     y_train,
     y_test,
     group_name: str = "Full_Group",
+    fit_model: bool = True,                                                                                  
 ):
     """
     Fit a scikit-learn classifier, compute predictions and metrics,
@@ -292,7 +309,8 @@ def evaluate_model(
 
     Also records a row in `results_records`.
     """
-    model.fit(X_train, y_train)
+    if fit_model:             
+      model.fit(X_train, y_train)
     y_pred = model.predict(X_test)
 
     # Probabilities for ROC; if not available, fall back to decision_function
@@ -383,6 +401,7 @@ def evaluate_model_keras(
     y_train,
     y_test,
     group_name: str = "Full_Group",
+    fit_model: bool = True,                                                                                  
 ):
     """
     Fit a Keras model (binary classification), compute predictions and metrics,
@@ -390,7 +409,8 @@ def evaluate_model_keras(
 
     Also records a row in `results_records`.
     """
-    model.fit(X_train, y_train, epochs=50, batch_size=32, verbose=1)
+    if fit_model:
+        model.fit(X_train, y_train, epochs=50, batch_size=32, verbose=1)
 
     y_prob = model.predict(X_test).flatten()
     y_pred = (y_prob > 0.5).astype("int32")
@@ -518,16 +538,6 @@ def create_cnn_model(input_shape):
 print("\nPerforming classification for the entire dataset (Full Group)...")
 print(f"Total dataset size: {len(data)} samples")
 
-X_train, X_test, y_train, y_test = train_test_split(
-    X_selected,
-    y,
-    test_size=0.2,
-    random_state=42,
-    stratify=y,
-)
-print(f"Training set size: {len(X_train)} samples")
-print(f"Testing set size: {len(X_test)} samples")
-
 # Initialize traditional ML models
 rf_model = RandomForestClassifier(
     n_estimators=100,
@@ -602,6 +612,60 @@ cnn_model.save(os.path.join(models_dir, 'cnn_model.h5'))
 joblib.dump(scaler, os.path.join(models_dir, 'scaler.joblib'))
 joblib.dump(kbest_selector, os.path.join(models_dir, 'kbest_selector.joblib'))
 joblib.dump(variance_selector, os.path.join(models_dir, 'variance_selector.joblib'))
+#SHAP Analysis
+# TreeExplainer is exact and fast for tree-based models
+explainer   = shap.TreeExplainer(rf_model)
+shap_values = explainer.shap_values(X_test)   
+shap_pos = shap_values[1] if isinstance(shap_values, list) else shap_values
+feature_names = selected_features.tolist()
+
+# ── Beeswarm summary plot ──────────────────────────────────────────────────────
+plt.figure()
+shap.summary_plot(
+    shap_pos,
+    X_test,
+    feature_names=feature_names,
+    plot_type="dot",
+    show=False,
+)
+plt.tight_layout()
+plt.savefig(os.path.join(results_dir_name, 'shap_beeswarm_RF_Full_Group.png'), dpi=150)
+plt.close()
+print(f"  Saved beeswarm plot → shap_beeswarm_RF_Full_Group.png")
+
+#  SHAP summary table
+X_test_raw = pd.DataFrame(
+    scaler.inverse_transform(
+        kbest_selector.inverse_transform(X_test)
+    ),
+    columns=features_to_keep,
+)[feature_names]
+
+mean_abs_shap   = np.abs(shap_pos).mean(axis=0)
+total_shap      = mean_abs_shap.sum()
+pct_contribution = (mean_abs_shap / total_shap * 100).round(1)
+
+effect_direction = []
+for j in range(shap_pos.shape[1]):
+    # Positive mean SHAP → higher feature value pushes toward Schizophrenia
+    direction = '+' if shap_pos[:, j].mean() >= 0 else '-'
+    effect_direction.append(direction)
+
+feat_means = X_test_raw.mean().values
+feat_stds  = X_test_raw.std().values
+
+shap_table = pd.DataFrame({
+    'Feature':          feature_names,
+    'Mean_Abs_SHAP':    mean_abs_shap.round(3),
+    'Effect_Direction': effect_direction,
+    'Mean':             feat_means.round(2),
+    'SD':               feat_stds.round(3),
+    'Pct_Contribution': pct_contribution,
+})
+shap_table = shap_table.sort_values('Mean_Abs_SHAP', ascending=False).reset_index(drop=True)
+
+shap_csv_path = os.path.join(results_dir_name, 'shap_summary_RF_Full_Group.csv')
+shap_table.to_csv(shap_csv_path, index=False)                                                               
 
 
 # ==========================================================
@@ -710,113 +774,124 @@ group_combinations = [
 for group in group_combinations:
     gender = group['Gender']
     race   = group['Race']
-    subset = data[(data['Gender'] == gender) & (data['Race'] == race)]
+    mask      = (meta_test['Gender'] == gender) & (meta_test['Race'] == race)
+    X_test_sg = X_test[mask.values]
+    y_test_sg = y_test[mask.values]
 
-    print(f"\nProcessing subgroup: {gender.capitalize()} / {race.capitalize()}")
-    print(f"Total subgroup size: {len(subset)} samples")
+    group_name = f"{gender.capitalize()}_{race.capitalize()}"
+    print(f"\nEvaluating subgroup on held-out test rows: {group_name}")
+    print(f"Subgroup test-set size: {len(X_test_sg)} samples")
 
-    # Require minimum number of samples to train/test split
-    if len(subset) > 5:
-        X_subset = subset[features_to_keep]
-        y_subset = subset['Group'].map(
-            {'control': 0, 'schizophrenia': 1}
-        ).astype('int8')
+    if len(X_test_sg) < 5:
+        print(f"  Skipping {group_name}: fewer than 5 test samples.")
+        continue
 
-        # For each subgroup, we re-fit scaler + k-best on subgroup only
-        X_subset_scaled = scaler.fit_transform(X_subset)
-        X_subset_selected = kbest_selector.fit_transform(X_subset_scaled, y_subset)
+    n_classes_sg = len(np.unique(y_test_sg))
+    if n_classes_sg < 2:
+        print(f"  Skipping {group_name}: only one class present in test split.")
+        continue
 
-        X_train_sg, X_test_sg, y_train_sg, y_test_sg = train_test_split(
-            X_subset_selected,
-            y_subset,
-            test_size=0.2,
-            random_state=42,
-            stratify=y_subset,
-        )
-        print(f"Training set size: {len(X_train_sg)} samples")
-        print(f"Testing set size: {len(X_test_sg)} samples")
-        group_name = f"{gender.capitalize()}_{race.capitalize()}"
+    # Evaluate pre-trained  models (fit_model=False → no re-training)
+    evaluate_model(
+        rf_model,  'Random_Forest',  X_train, X_test_sg,
+        y_train, y_test_sg, group_name=group_name, fit_model=False,
+    )
+    evaluate_model(
+        svm_model, 'SVM',            X_train, X_test_sg,
+        y_train, y_test_sg, group_name=group_name, fit_model=False,
+    )
+    evaluate_model(
+        mlp_model, 'Neural_Network', X_train, X_test_sg,
+        y_train, y_test_sg, group_name=group_name, fit_model=False,
+    )
 
-        # Evaluate traditional ML models on subgroup
-        evaluate_model(
-            rf_model,
-            'Random_Forest',
-            X_train_sg,
-            X_test_sg,
-            y_train_sg,
-            y_test_sg,
-            group_name=group_name,
-        )
-        evaluate_model(
-            svm_model,
-            'SVM',
-            X_train_sg,
-            X_test_sg,
-            y_train_sg,
-            y_test_sg,
-            group_name=group_name,
-        )
-        evaluate_model(
-            mlp_model,
-            'Neural_Network',
-            X_train_sg,
-            X_test_sg,
-            y_train_sg,
-            y_test_sg,
-            group_name=group_name,
-        )
+    # Reshape subgroup test rows for sequence models (full-sample models are reused)
+    X_test_sg_lstm = X_test_sg.reshape((X_test_sg.shape[0], 1, X_test_sg.shape[1]))
+    X_test_sg_cnn  = X_test_sg.reshape((X_test_sg.shape[0], X_test_sg.shape[1], 1))
 
-        # Sequence reshapes for subgroup
-        X_train_sg_lstm = X_train_sg.reshape(
-            (X_train_sg.shape[0], 1, X_train_sg.shape[1])
-        )
-        X_test_sg_lstm = X_test_sg.reshape(
-            (X_test_sg.shape[0], 1, X_test_sg.shape[1])
-        )
-        X_train_sg_cnn = X_train_sg.reshape(
-            (X_train_sg.shape[0], X_train_sg.shape[1], 1)
-        )
-        X_test_sg_cnn = X_test_sg.reshape(
-            (X_test_sg.shape[0], X_test_sg.shape[1], 1)
-        )
+    # Evaluate pre-trained  models (fit_model=False → no re-training)
+    evaluate_model_keras(
+        lstm_model, 'LSTM', X_train_lstm, X_test_sg_lstm,
+        y_train, y_test_sg, group_name=group_name, fit_model=False,
+    )
+    evaluate_model_keras(
+        gru_model,  'GRU',  X_train_lstm, X_test_sg_lstm,
+        y_train, y_test_sg, group_name=group_name, fit_model=False,
+    )
+    evaluate_model_keras(
+        cnn_model,  'CNN',  X_train_cnn,  X_test_sg_cnn,
+        y_train, y_test_sg, group_name=group_name, fit_model=False,
+    )
 
-        # Fresh Keras models per subgroup
-        lstm_model_sg = create_lstm_model((1, X_train_sg.shape[1]))
-        evaluate_model_keras(
-            lstm_model_sg,
-            'LSTM',
-            X_train_sg_lstm,
-            X_test_sg_lstm,
-            y_train_sg,
-            y_test_sg,
-            group_name=group_name,
-        )
+    # ── Ensemble on subgroup test rows ─────────────────────────────────────────
+    rf_probs_sg   = rf_model.predict_proba(X_test_sg)[:, 1]
+    svm_probs_sg  = svm_model.predict_proba(X_test_sg)[:, 1]
+    mlp_probs_sg  = mlp_model.predict_proba(X_test_sg)[:, 1]
+    lstm_probs_sg = lstm_model.predict(X_test_sg_lstm).flatten()
+    gru_probs_sg  = gru_model.predict(X_test_sg_lstm).flatten()
+    cnn_probs_sg  = cnn_model.predict(X_test_sg_cnn).flatten()
+															  
+    ens_prob_sg = (
+        weights["rf"]   * rf_probs_sg   +
+        weights["svm"]  * svm_probs_sg  +
+        weights["mlp"]  * mlp_probs_sg  +
+        weights["lstm"] * lstm_probs_sg +
+        weights["gru"]  * gru_probs_sg  +
+        weights["cnn"]  * cnn_probs_sg
+    )
+    ens_pred_sg = (ens_prob_sg > 0.5).astype("int32")
+    acc_sg  = accuracy_score(y_test_sg, ens_pred_sg)
+    rep_sg  = classification_report(
+        y_test_sg, ens_pred_sg,
+        target_names=['Control', 'Schizophrenia'],
+        output_dict=True,
+    )
+    auc_sg       = roc_auc_score(y_test_sg, ens_prob_sg)
+    fpr_sg, tpr_sg, _ = roc_curve(y_test_sg, ens_prob_sg)
 
-        gru_model_sg = create_gru_model((1, X_train_sg.shape[1]))
-        evaluate_model_keras(
-            gru_model_sg,
-            'GRU',
-            X_train_sg_lstm,
-            X_test_sg_lstm,
-            y_train_sg,
-            y_test_sg,
-            group_name=group_name,
-        )
+    plt.figure(figsize=(6, 4))
+    sns.heatmap(
+							 
+        confusion_matrix(y_test_sg, ens_pred_sg),
+        annot=True, fmt='d', cmap='Blues',
+        xticklabels=['Control', 'Schizophrenia'],
+        yticklabels=['Control', 'Schizophrenia'],
+    )
+    plt.title(f'Confusion Matrix for Ensemble ({group_name})\nAccuracy: {acc_sg:.2f}')
+    plt.xlabel('Predicted'); plt.ylabel('Actual')
+    plt.tight_layout()
+    plt.savefig(os.path.join(results_dir_name, f'confusion_matrix_Ensemble_{group_name}.png'))
+    plt.close()
 
-        cnn_model_sg = create_cnn_model((X_train_sg.shape[1], 1))
-        evaluate_model_keras(
-            cnn_model_sg,
-            'CNN',
-            X_train_sg_cnn,
-            X_test_sg_cnn,
-            y_train_sg,
-            y_test_sg,
-            group_name=group_name,
-        )
-    else:
-        print(f"Skipping {gender.capitalize()} / {race.capitalize()} due to insufficient samples (< 5).")
+    plt.figure(figsize=(6, 4))
+    plt.plot(fpr_sg, tpr_sg, label=f'AUC = {auc_sg:.2f}')
+    plt.plot([0, 1], [0, 1], linestyle='--')
+    plt.title(f'ROC Curve for Ensemble ({group_name})\nAccuracy: {acc_sg:.2f}')
+    plt.xlabel('False Positive Rate'); plt.ylabel('True Positive Rate')
+    plt.legend(); plt.tight_layout()
+    plt.savefig(os.path.join(results_dir_name, f'roc_curve_Ensemble_{group_name}.png'))
+    plt.close()
 
-
+    test_dist_sg = class_distribution(y_test_sg)
+    results_records.append({
+        "Model": "Ensemble",
+        "Group": group_name,
+        "Train_Control_Count": train_dist.get(0, 0),
+        "Train_Schizophrenia_Count": train_dist.get(1, 0),
+        "Test_Control_Count": test_dist_sg.get(0, 0),
+        "Test_Schizophrenia_Count": test_dist_sg.get(1, 0),
+        "Accuracy": acc_sg,
+        "AUC": auc_sg,
+        "Control_Precision": rep_sg["Control"]["precision"],
+        "Control_Recall": rep_sg["Control"]["recall"],
+        "Control_F1": rep_sg["Control"]["f1-score"],
+        "Schizophrenia_Precision": rep_sg["Schizophrenia"]["precision"],
+        "Schizophrenia_Recall": rep_sg["Schizophrenia"]["recall"],
+        "Schizophrenia_F1": rep_sg["Schizophrenia"]["f1-score"],
+        "Macro_Avg_F1": rep_sg["macro avg"]["f1-score"],
+        "Time": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    })
+    
 # ==========================================================
 # Save Evaluation Summary
 # ==========================================================
